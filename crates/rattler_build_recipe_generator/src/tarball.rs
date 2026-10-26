@@ -120,11 +120,11 @@ fn is_archive_file(path: &Path, relative: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Build an in-memory `.tar.gz` with the given `(path, contents)` entries.
-    fn tarball_with(files: &[(&str, &[u8])]) -> Vec<u8> {
+    pub(crate) fn tarball_with(files: &[(&str, &[u8])]) -> Vec<u8> {
         let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         let mut builder = tar::Builder::new(encoder);
         for (path, contents) in files {

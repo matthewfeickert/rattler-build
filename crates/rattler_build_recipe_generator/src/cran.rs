@@ -298,6 +298,24 @@ struct CranTarball {
     has_fortran_sources: bool,
     /// Whether `src/` holds C++ sources, at any depth, as for Fortran.
     has_cxx_sources: bool,
+    /// Whether a `src/Makevars*` file links R's BLAS or LAPACK.
+    links_blas_lapack: bool,
+}
+
+/// The Makevars files R reads from `src/`: `Makevars.in` is the template a
+/// `configure` script turns into `Makevars`, and Windows builds prefer
+/// `Makevars.ucrt` over `Makevars.win` over `Makevars`.
+const MAKEVARS: &[&str] = &[
+    "src/Makevars",
+    "src/Makevars.in",
+    "src/Makevars.win",
+    "src/Makevars.ucrt",
+];
+
+/// Whether the make file `contents` reference the make variable `name`, as
+/// `$(name)` or `${name}`.
+fn references_make_variable(contents: &str, name: &str) -> bool {
+    contents.contains(&format!("$({name})")) || contents.contains(&format!("${{{name}}}"))
 }
 
 impl CranTarball {
@@ -305,8 +323,23 @@ impl CranTarball {
         // One decompression pass for everything the tarball can tell us. A
         // failure here means the bytes are not a source archive at all, so
         // nothing about them — the checksum included — can be trusted.
-        let mut scan =
-            tarball::scan_archive(bytes, &["DESCRIPTION", "tests/testthat.R"], Some("src"))?;
+        let wanted: Vec<&str> = ["DESCRIPTION", "tests/testthat.R"]
+            .into_iter()
+            .chain(MAKEVARS.iter().copied())
+            .collect();
+        let mut scan = tarball::scan_archive(bytes, &wanted, Some("src"))?;
+        let makevars: Vec<&str> = MAKEVARS
+            .iter()
+            .filter_map(|file| scan.files.get(file).map(String::as_str))
+            .collect();
+        // Writing R Extensions asks for `$(BLAS_LIBS)` wherever
+        // `$(LAPACK_LIBS)` is used, as some implementations ship LAPACK apart
+        // from BLAS, so either one needs both libraries.
+        let links_blas_lapack = makevars.iter().any(|contents| {
+            ["BLAS_LIBS", "LAPACK_LIBS"]
+                .iter()
+                .any(|name| references_make_variable(contents, name))
+        });
         Ok(Self {
             sha256: Some(hex::encode(compute_bytes_digest::<Sha256>(bytes))),
             description: scan.files.remove("DESCRIPTION"),
@@ -319,6 +352,7 @@ impl CranTarball {
                 .listed
                 .iter()
                 .any(|path| has_extension(path, CXX_EXTENSIONS)),
+            links_blas_lapack,
         })
     }
 }
@@ -753,6 +787,14 @@ fn package_info_to_recipe(
         .unique()
         .map(Requirement::from)
         .collect();
+    if tarball.is_some_and(|tarball| tarball.links_blas_lapack) {
+        // conda-forge's BLAS and LAPACK interfaces; the implementation behind
+        // them is chosen at install time.
+        recipe
+            .requirements
+            .host
+            .extend(["libblas".into(), "liblapack".into()]);
+    }
     recipe.requirements.run = std::iter::once(r_base)
         .chain(run)
         .unique()
@@ -1197,6 +1239,42 @@ mod tests {
         };
         assert!(build_of(Some(&with_cxx)).contains(&cxx()));
         assert!(build_of(None).contains(&cxx()));
+    }
+
+    /// `$(BLAS_LIBS)` or `$(LAPACK_LIBS)` in any of the Makevars files R
+    /// reads requires conda-forge's BLAS and LAPACK interfaces.
+    #[test]
+    fn makevars_linking_blas_or_lapack_require_both() {
+        let parse = |files: &[(&str, &[u8])]| {
+            CranTarball::parse(&crate::tarball::tests::tarball_with(files)).unwrap()
+        };
+        for (makevars, contents) in [
+            (
+                "pkg/src/Makevars",
+                &b"PKG_LIBS = $(LAPACK_LIBS) $(BLAS_LIBS) $(FLIBS)\n"[..],
+            ),
+            ("pkg/src/Makevars.in", b"PKG_LIBS = @LIBS@ ${BLAS_LIBS}\n"),
+            ("pkg/src/Makevars.win", b"PKG_LIBS = $(LAPACK_LIBS)\n"),
+        ] {
+            assert!(
+                parse(&[(makevars, contents)]).links_blas_lapack,
+                "{makevars}"
+            );
+        }
+        // Not R's variable, and not a Makevars file R reads.
+        assert!(!parse(&[("pkg/src/Makevars", b"PKG_LIBS = -lMYBLAS_LIBS\n")]).links_blas_lapack);
+        assert!(!parse(&[("pkg/src/lib/Makevars", b"LIBS = $(BLAS_LIBS)\n")]).links_blas_lapack);
+
+        let tarball = CranTarball {
+            links_blas_lapack: true,
+            ..Default::default()
+        };
+        let (recipe, _) =
+            package_info_to_recipe(&fixture("gmp"), Some(&tarball), &RecipeOptions::default());
+        assert_eq!(
+            recipe.requirements.host,
+            vec!["r-base".into(), "libblas".into(), "liblapack".into()]
+        );
     }
 
     #[test]
