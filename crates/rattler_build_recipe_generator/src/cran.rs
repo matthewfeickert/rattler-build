@@ -300,6 +300,8 @@ struct CranTarball {
     has_cxx_sources: bool,
     /// Whether a `src/Makevars*` file links R's BLAS or LAPACK.
     links_blas_lapack: bool,
+    /// Whether a `src/Makevars*` file uses R's OpenMP flags.
+    uses_openmp: bool,
 }
 
 /// The Makevars files R reads from `src/`: `Makevars.in` is the template a
@@ -340,6 +342,16 @@ impl CranTarball {
                 .iter()
                 .any(|name| references_make_variable(contents, name))
         });
+        let uses_openmp = makevars.iter().any(|contents| {
+            [
+                "SHLIB_OPENMP_CFLAGS",
+                "SHLIB_OPENMP_CXXFLAGS",
+                "SHLIB_OPENMP_FFLAGS",
+                "SHLIB_OPENMP_FCFLAGS",
+            ]
+            .iter()
+            .any(|name| references_make_variable(contents, name))
+        });
         Ok(Self {
             sha256: Some(hex::encode(compute_bytes_digest::<Sha256>(bytes))),
             description: scan.files.remove("DESCRIPTION"),
@@ -353,6 +365,7 @@ impl CranTarball {
                 .iter()
                 .any(|path| has_extension(path, CXX_EXTENSIONS)),
             links_blas_lapack,
+            uses_openmp,
         })
     }
 }
@@ -794,6 +807,20 @@ fn package_info_to_recipe(
             .requirements
             .host
             .extend(["libblas".into(), "liblapack".into()]);
+    }
+    if tarball.is_some_and(|tarball| tarball.uses_openmp) {
+        // The OpenMP runtime of the platform's compilers: clang on macOS, GCC
+        // (MinGW on Windows) everywhere else.
+        recipe.requirements.host.extend([
+            Requirement::Conditional {
+                condition: "osx".to_string(),
+                then: vec!["llvm-openmp".to_string()],
+            },
+            Requirement::Conditional {
+                condition: "not osx".to_string(),
+                then: vec!["libgomp".to_string()],
+            },
+        ]);
     }
     recipe.requirements.run = std::iter::once(r_base)
         .chain(run)
@@ -1274,6 +1301,46 @@ mod tests {
         assert_eq!(
             recipe.requirements.host,
             vec!["r-base".into(), "libblas".into(), "liblapack".into()]
+        );
+    }
+
+    /// Any of R's OpenMP flags in a Makevars file requires the OpenMP runtime
+    /// that matches the platform's compilers.
+    #[test]
+    fn makevars_using_openmp_require_the_openmp_runtime() {
+        let parse = |contents: &[u8]| {
+            CranTarball::parse(&crate::tarball::tests::tarball_with(&[(
+                "pkg/src/Makevars",
+                contents,
+            )]))
+            .unwrap()
+        };
+        for contents in [
+            &b"PKG_CFLAGS = $(SHLIB_OPENMP_CFLAGS)\n"[..],
+            b"PKG_CXXFLAGS = ${SHLIB_OPENMP_CXXFLAGS}\n",
+            b"PKG_FFLAGS = $(SHLIB_OPENMP_FFLAGS)\n",
+            b"PKG_FCFLAGS = $(SHLIB_OPENMP_FCFLAGS)\n",
+        ] {
+            assert!(
+                parse(contents).uses_openmp,
+                "{}",
+                String::from_utf8_lossy(contents)
+            );
+        }
+        assert!(!parse(b"PKG_CFLAGS = -O2\n").uses_openmp);
+
+        let tarball = CranTarball {
+            uses_openmp: true,
+            ..Default::default()
+        };
+        let (recipe, _) =
+            package_info_to_recipe(&fixture("gmp"), Some(&tarball), &RecipeOptions::default());
+        let yaml = recipe.to_string();
+        assert!(
+            yaml.contains(
+                "  host:\n    - r-base\n    - if: osx\n      then:\n        - llvm-openmp\n    - if: not osx\n      then:\n        - libgomp\n"
+            ),
+            "{yaml}"
         );
     }
 
