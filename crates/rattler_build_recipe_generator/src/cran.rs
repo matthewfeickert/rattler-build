@@ -533,6 +533,17 @@ fn cross_r_base_requirement() -> Requirement {
     }
 }
 
+/// The MSYS2 tools `R CMD INSTALL` runs on Windows, as conda-forge's R recipes
+/// list them: the shell utilities of R's own make files and build scripts,
+/// `make`, and `zip` to package the binary build.
+const M2_BUILD_TOOLS: &[&str] = &[
+    "m2-filesystem",
+    "m2-make",
+    "m2-sed",
+    "m2-coreutils",
+    "m2-zip",
+];
+
 /// The CRAN mirror the generated recipes download from: the CDN that
 /// conda-forge also pins its `cran_mirror` variant to.
 const CRAN_MIRROR: &str = "https://cloud.r-project.org";
@@ -835,24 +846,47 @@ fn package_info_to_recipe(
         // and rpaths so the linker can find R's shared libraries.
         // The C compiler is always needed: R links shared objects with it,
         // even those built from Fortran sources.
-        let mut build = vec![cross_r_base_requirement(), "${{ compiler(\"c\") }}".into()];
+        let mut languages = vec!["c"];
         // A C-only package must not get the C++ compiler, or the C++ runtime
         // it adds to the run requirements is reported as unused. Without the
         // tarball the sources are unknown, so C++ is assumed.
         if tarball.is_none_or(|tarball| tarball.has_cxx_sources) {
-            build.push("${{ compiler(\"cxx\") }}".into());
+            languages.push("cxx");
         }
         if tarball.is_some_and(|tarball| tarball.has_fortran_sources) {
-            build.push("${{ compiler(\"fortran\") }}".into());
+            languages.push("fortran");
         }
-        if options.staged_recipes {
-            // conda-forge's linter requires the C standard library next to a
-            // compiler. rattler-build itself knows no `c_stdlib`, so a plain
-            // build could not render it.
-            build.push("${{ stdlib(\"c\") }}".into());
-        }
-        build.push("make".into());
-        recipe.requirements.build = build;
+        // R on Windows builds packages with MinGW GCC and MSYS2 tools, the
+        // `m2w64_*` compilers and `m2-*` packages of conda-forge, as Rtools
+        // does for CRAN.
+        let toolchain = |compiler_prefix: &str| -> Vec<String> {
+            let mut toolchain: Vec<String> = languages
+                .iter()
+                .map(|language| format!("${{{{ compiler(\"{compiler_prefix}{language}\") }}}}"))
+                .collect();
+            if options.staged_recipes {
+                // conda-forge's linter requires the C standard library next to
+                // a compiler. rattler-build itself knows no `c_stdlib`, so a
+                // plain build could not render it.
+                toolchain.push(format!("${{{{ stdlib(\"{compiler_prefix}c\") }}}}"));
+            }
+            toolchain
+        };
+        let mut unix = toolchain("");
+        unix.push("make".to_string());
+        let mut windows = toolchain("m2w64_");
+        windows.extend(M2_BUILD_TOOLS.iter().map(|tool| tool.to_string()));
+        recipe.requirements.build = vec![
+            cross_r_base_requirement(),
+            Requirement::Conditional {
+                condition: "not win".to_string(),
+                then: unix,
+            },
+            Requirement::Conditional {
+                condition: "win".to_string(),
+                then: windows,
+            },
+        ];
         recipe.build.dynamic_linking = Some(serialize::DynamicLinking {
             rpaths: vec!["lib/R/lib/".to_string(), "lib/".to_string()],
         });
@@ -1195,17 +1229,31 @@ mod tests {
                 .requirements
                 .build
         };
-        let stdlib = || Requirement::from("${{ stdlib(\"c\") }}");
+        let plain = build_of("gmp", false);
+        let (unix, windows) = toolchains(&plain);
+        assert!(!unix.iter().any(|spec| spec.contains("stdlib")), "{unix:?}");
+        assert!(
+            !windows.iter().any(|spec| spec.contains("stdlib")),
+            "{windows:?}"
+        );
 
-        assert!(!build_of("gmp", false).contains(&stdlib()));
+        let staged = build_of("gmp", true);
+        let (unix, windows) = toolchains(&staged);
         assert_eq!(
-            build_of("gmp", true),
-            vec![
-                cross_r_base_requirement(),
-                "${{ compiler(\"c\") }}".into(),
-                "${{ compiler(\"cxx\") }}".into(),
-                stdlib(),
-                "make".into(),
+            unix,
+            [
+                "${{ compiler(\"c\") }}",
+                "${{ compiler(\"cxx\") }}",
+                "${{ stdlib(\"c\") }}",
+                "make",
+            ]
+        );
+        assert_eq!(
+            windows[..3],
+            [
+                "${{ compiler(\"m2w64_c\") }}",
+                "${{ compiler(\"m2w64_cxx\") }}",
+                "${{ stdlib(\"m2w64_c\") }}",
             ]
         );
         // Pure-R packages have no compiler, so nothing to pair it with.
@@ -1226,15 +1274,67 @@ mod tests {
             ..Default::default()
         };
         let (recipe, _) = package_info_to_recipe(&fixture("gmp"), Some(&tarball), &options);
+        let (unix, windows) = toolchains(&recipe.requirements.build);
         assert_eq!(
-            recipe.requirements.build,
-            vec![
-                cross_r_base_requirement(),
-                "${{ compiler(\"c\") }}".into(),
-                "${{ compiler(\"cxx\") }}".into(),
-                "${{ compiler(\"fortran\") }}".into(),
-                "${{ stdlib(\"c\") }}".into(),
-                "make".into(),
+            unix,
+            [
+                "${{ compiler(\"c\") }}",
+                "${{ compiler(\"cxx\") }}",
+                "${{ compiler(\"fortran\") }}",
+                "${{ stdlib(\"c\") }}",
+                "make",
+            ]
+        );
+        assert_eq!(
+            windows[..4],
+            [
+                "${{ compiler(\"m2w64_c\") }}",
+                "${{ compiler(\"m2w64_cxx\") }}",
+                "${{ compiler(\"m2w64_fortran\") }}",
+                "${{ stdlib(\"m2w64_c\") }}",
+            ]
+        );
+    }
+
+    /// The build requirements of a compiled package outside and on Windows,
+    /// checking the shape around them.
+    fn toolchains(build: &[Requirement]) -> (&[String], &[String]) {
+        match build {
+            [
+                cross_r_base,
+                Requirement::Conditional {
+                    condition: not_win,
+                    then: unix,
+                },
+                Requirement::Conditional {
+                    condition: win,
+                    then: windows,
+                },
+            ] if *cross_r_base == cross_r_base_requirement()
+                && not_win == "not win"
+                && win == "win" =>
+            {
+                (unix, windows)
+            }
+            other => panic!("unexpected build requirements: {other:?}"),
+        }
+    }
+
+    /// Windows builds use the MinGW compilers and MSYS2 tools.
+    #[test]
+    fn windows_builds_use_the_mingw_toolchain() {
+        let (recipe, _) = package_info_to_recipe(&fixture("gmp"), None, &RecipeOptions::default());
+        let (_, windows) = toolchains(&recipe.requirements.build);
+        assert_eq!(
+            windows,
+            [
+                "${{ compiler(\"m2w64_c\") }}",
+                "${{ compiler(\"m2w64_cxx\") }}",
+                "m2-filesystem",
+                "m2-make",
+                "m2-sed",
+                "m2-coreutils",
+                "m2-zip",
             ]
         );
     }
@@ -1249,23 +1349,25 @@ mod tests {
                 .requirements
                 .build
         };
-        let cxx = || Requirement::from("${{ compiler(\"cxx\") }}");
+        let has_cxx = |build: &[Requirement]| {
+            let (unix, windows) = toolchains(build);
+            let unix_cxx = unix.iter().any(|spec| spec == "${{ compiler(\"cxx\") }}");
+            let windows_cxx = windows
+                .iter()
+                .any(|spec| spec == "${{ compiler(\"m2w64_cxx\") }}");
+            assert_eq!(unix_cxx, windows_cxx);
+            unix_cxx
+        };
 
-        let c_only = CranTarball::default();
-        assert_eq!(
-            build_of(Some(&c_only)),
-            vec![
-                cross_r_base_requirement(),
-                "${{ compiler(\"c\") }}".into(),
-                "make".into(),
-            ]
-        );
+        let c_only = build_of(Some(&CranTarball::default()));
+        assert_eq!(toolchains(&c_only).0, ["${{ compiler(\"c\") }}", "make"]);
+        assert!(!has_cxx(&c_only));
         let with_cxx = CranTarball {
             has_cxx_sources: true,
             ..Default::default()
         };
-        assert!(build_of(Some(&with_cxx)).contains(&cxx()));
-        assert!(build_of(None).contains(&cxx()));
+        assert!(has_cxx(&build_of(Some(&with_cxx))));
+        assert!(has_cxx(&build_of(None)));
     }
 
     /// `$(BLAS_LIBS)` or `$(LAPACK_LIBS)` in any of the Makevars files R
